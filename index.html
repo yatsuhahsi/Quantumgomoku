@@ -7,6 +7,7 @@
     <!-- 安定した Firebase SDK (v9 compat) -->
     <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-app-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-database-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.23.0/firebase-auth-compat.js"></script>
     <style>
         :root {
             --bg-color: #0b0f19;
@@ -422,21 +423,25 @@
     <script>
         // === Firebase設定（取得した情報をそのまま貼り付けてください） ===
         const firebaseConfig = {
-  apiKey: "AIzaSyAy9fy9OeTgkh7g0ClABiSdW5iRmT6OVWA",
-  databaseURL: "https://quantumgomoku-675d5-default-rtdb.firebaseio.com",
-  authDomain: "quantumgomoku-675d5.firebaseapp.com",
-  projectId: "quantumgomoku-675d5",
-  storageBucket: "quantumgomoku-675d5.firebasestorage.app",
-  messagingSenderId: "705398450271",
-  appId: "1:705398450271:web:113b34d78fae4cd1c393ea"
-};
+            apiKey: "AIzaSyAy9fy9OeTgkh7g0ClABiSdW5iRmT6OVWA",
+            authDomain: "quantumgomoku-675d5.firebaseapp.com",
+            databaseURL: "https://quantumgomoku-675d5-default-rtdb.firebaseio.com",
+            projectId: "quantumgomoku-675d5",
+            storageBucket: "quantumgomoku-675d5.firebasestorage.app",
+            messagingSenderId: "705398450271",
+            appId: "1:705398450271:web:113b34d78fae4cd1c393ea"
+        };
 
         // Firebase初期化 (Compat API)
         let db = null;
+        let auth = null;
+        let authReady = null;
         try {
             if (firebaseConfig.apiKey !== "YOUR_API_KEY") {
                 firebase.initializeApp(firebaseConfig);
                 db = firebase.database();
+                auth = firebase.auth();
+                authReady = auth.signInAnonymously().then(() => auth.currentUser).catch(e => { console.error("Firebase auth error",e); throw e; });
             }
         } catch (e) {
             console.error("Firebase init error:", e);
@@ -469,6 +474,11 @@
         let lastObservedSeq = 0;
         let winnerRole = null;
         let winDetailReason = "";
+        let activeRoomRef = null;
+        let onlineBusy = false;
+        let onlineRevision = 0;
+        let displayedObsSeq = 0;
+        let pendingOnlineRoom = false;
 
         // Web Audio API
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -545,6 +555,10 @@
         }
 
         function resetGame() {
+            if (gameMode === 'online' && roomId && gameOver) {
+                onlineVoteRematch();
+                return;
+            }
             board = Array(BOARD_SIZE).fill(null).map(() => Array(BOARD_SIZE).fill(null));
             turn = 'P1';
             p1TurnCount = 0;
@@ -569,6 +583,17 @@
         }
 
         function setGameMode(mode) {
+            if (activeRoomRef) { activeRoomRef.off(); activeRoomRef = null; }
+            roomId = null;
+            pendingOnlineRoom = false;
+            onlineBusy = false;
+            document.getElementById('btn-create-room').style.display = 'flex';
+            document.getElementById('join-input-box').style.display = 'flex';
+            document.getElementById('room-id-box').style.display = 'none';
+            const readyBtn = document.getElementById('btn-ready');
+            readyBtn.style.display = 'none'; readyBtn.disabled = false;
+            readyBtn.innerText = '🎮 対局開始準備 (Ready)';
+            document.getElementById('online-status').innerText = mode === 'online' ? 'Firebaseの認証を確認中...' : '';
             gameMode = mode;
             document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
             document.getElementById(`mode-${mode}`).classList.add('active');
@@ -577,6 +602,10 @@
             gameStarted = mode !== 'online';
             myRole = null;
             resetGame();
+            if (mode === 'online') {
+                requireOnlineAuth().then(() => setOnlineStatus('接続準備完了。ルームを作成または参加してください。'))
+                    .catch(showOnlineError);
+            }
         }
 
         function drawBoard() {
@@ -688,6 +717,7 @@
         }
 
         function placeStone(r, c) {
+            if (gameMode === 'online') { onlinePlaceStone(r, c); return; }
             const count = turn === 'P1' ? p1TurnCount : p2TurnCount;
             const prob = getNextBlackProbability(turn, count);
 
@@ -727,6 +757,7 @@
         }
 
         function triggerObservation() {
+            if (gameMode === 'online') { onlineObserve(); return; }
             if (gameOver || isMeasuring) return;
 
             const obsLeft = turn === 'P1' ? p1ObsLeft : p2ObsLeft;
@@ -742,6 +773,7 @@
         }
 
         function finishTurnWithoutObservation() {
+            if (gameMode === 'online') { onlinePass(); return; }
             awaitActionChoice = false;
             turn = turn === 'P1' ? 'P2' : 'P1';
 
@@ -963,146 +995,279 @@
             }
         }
 
-        // === オンライン対戦機能 (Compat API) ===
-        function createOnlineRoom() {
-            if (!db) { alert("Firebaseの設定キーが入力されていません！"); return; }
-            roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
-            myRole = 'P1';
-
-            document.getElementById('created-room-id').innerText = roomId;
-            document.getElementById('room-id-box').style.display = 'flex';
-            document.getElementById('btn-create-room').style.display = 'none';
-            document.getElementById('join-input-box').style.display = 'none';
-            document.getElementById('btn-ready').style.display = 'block';
-
-            const roomRef = db.ref('rooms/' + roomId);
-            roomRef.set({
-                board: JSON.stringify(board),
-                turn: 'P1',
-                p1TurnCount: 0,
-                p2TurnCount: 0,
-                p1ObsLeft: 5,
-                p2ObsLeft: 5,
-                p1Ready: false,
-                p2Ready: false,
-                gameStarted: false,
-                gameOver: false,
-                isMeasuring: false,
-                awaitActionChoice: false,
-                lastObservedSeq: 0,
-                winnerRole: null,
-                winDetailReason: ""
-            });
-
-            document.getElementById('online-status').innerText = `ルーム作成完了！相手の参加を待っています...`;
-            log(`🌐 ルーム作成 ID: ${roomId}`);
-            listenToOnlineRoom();
+        // === オンライン対戦 (Firebase Authentication + Realtime Database) ===
+        // 各手をトランザクションで更新し、2端末の競合を防ぐ。
+        // 本方式は友人同士の対戦用。抽選・勝敗のサーバー検証は未実装。
+        const blankBoard = () => Array.from({length: BOARD_SIZE}, () => Array(BOARD_SIZE).fill(null));
+        const onlineStatus = () => document.getElementById('online-status');
+        function setOnlineStatus(message) { onlineStatus().innerText = message; }
+        function showOnlineError(err) {
+            console.error('オンライン通信エラー:', err);
+            const code = err && err.code ? ` (${err.code})` : '';
+            const msg = err && err.message ? err.message : String(err);
+            setOnlineStatus('⚠️ ' + msg + code);
+            alert('Firebase通信エラー' + code + '\n' + msg + '\nAuthentication・Realtime Databaseのルールを確認してください。');
         }
-
-        function joinOnlineRoom() {
-            if (!db) { alert("Firebaseの設定キーが入力されていません！"); return; }
-            const inputCode = document.getElementById('room-input').value.trim().toUpperCase();
-            if (!inputCode) return;
-
-            roomId = inputCode;
-            myRole = 'P2';
-
-            db.ref('rooms/' + roomId).once('value', snapshot => {
-                if (snapshot.exists()) {
+        async function requireOnlineAuth() {
+            if (!db || !auth || !authReady) throw new Error('Firebaseの初期化に失敗しました。');
+            await authReady;
+            if (!auth.currentUser) throw new Error('匿名認証に失敗しました。Firebaseで匿名認証を有効にしてください。');
+            return auth.currentUser.uid;
+        }
+        function makeInitialRoom(uid) {
+            return {
+                p1Uid: uid, p1Ready: false, p2Ready: false,
+                board: JSON.stringify(blankBoard()), turn: 'P1',
+                p1TurnCount: 0, p2TurnCount: 0,
+                p1ObsLeft: 5, p2ObsLeft: 5,
+                gameStarted: false, gameOver: false, awaitActionChoice: false,
+                isMeasuring: false, lastObservedSeq: 0,
+                winnerRole: '', winDetailReason: '',
+                p1Rematch: false, p2Rematch: false,
+                version: 0
+            };
+        }
+        function newRoomCode() {
+            const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+            const bytes = new Uint32Array(6); crypto.getRandomValues(bytes);
+            return Array.from(bytes, v => alphabet[v % alphabet.length]).join('');
+        }
+        function roomRef() {
+            if (!roomId) throw new Error('ルームが選択されていません。');
+            return db.ref('rooms/' + roomId);
+        }
+        async function createOnlineRoom() {
+            if (pendingOnlineRoom || roomId) return;
+            pendingOnlineRoom = true;
+            try {
+                const uid = await requireOnlineAuth();
+                setOnlineStatus('ルームを作成中...');
+                for (let attempt = 0; attempt < 4; attempt++) {
+                    const code = newRoomCode();
+                    const ref = db.ref('rooms/' + code);
+                    const result = await ref.transaction(existing => existing === null ? makeInitialRoom(uid) : undefined,
+                        undefined, false);
+                    if (!result.committed) continue;
+                    roomId = code; myRole = 'P1';
+                    document.getElementById('created-room-id').innerText = code;
+                    document.getElementById('room-id-box').style.display = 'flex';
                     document.getElementById('btn-create-room').style.display = 'none';
                     document.getElementById('join-input-box').style.display = 'none';
                     document.getElementById('btn-ready').style.display = 'block';
-                    document.getElementById('online-status').innerText = `ルーム ${roomId} に接続！準備完了を押してください。`;
-                    log(`🌐 ルーム ${roomId} に接続しました。`);
+                    setOnlineStatus('ルーム作成成功。相手の参加を待っています。');
+                    log('🌐 ルーム作成 ID: ' + code);
                     listenToOnlineRoom();
-                } else {
-                    alert("指定されたルームが見つかりません。");
+                    return;
                 }
-            });
+                throw new Error('ルーム番号の確保に失敗しました。再度お試しください。');
+            } catch (err) { showOnlineError(err); }
+            finally { pendingOnlineRoom = false; }
         }
-
+        async function joinOnlineRoom() {
+            if (pendingOnlineRoom || roomId) return;
+            const code = document.getElementById('room-input').value.trim().toUpperCase();
+            if (!/^[A-Z2-9]{6}$/.test(code)) {
+                alert('6文字のルームコードを入力してください。'); return;
+            }
+            pendingOnlineRoom = true;
+            try {
+                const uid = await requireOnlineAuth();
+                setOnlineStatus('ルームに参加中...');
+                const ref = db.ref('rooms/' + code);
+                // Firebaseセキュリティルールではコードを知る認証済みユーザーのみ読み取り可
+                const initial = await ref.once('value');
+                if (!initial.exists()) throw new Error('ルームが見つかりません。コードを確認してください。');
+                const existing = initial.val();
+                if (existing.p1Uid === uid || existing.p2Uid === uid) {
+                    myRole = existing.p1Uid === uid ? 'P1' : 'P2';
+                } else {
+                    if (existing.p2Uid) throw new Error('このルームにはすでに2人参加しています。');
+                    const result = await ref.transaction(data => {
+                        if (!data || data.p2Uid || data.gameStarted || data.p1Uid === uid) return;
+                        data.p2Uid = uid;
+                        data.version = (data.version || 0) + 1;
+                        return data;
+                    }, undefined, false);
+                    if (!result.committed) throw new Error('参加できませんでした。ルームが満員か、対局開始済みです。');
+                    myRole = 'P2';
+                }
+                roomId = code;
+                document.getElementById('btn-create-room').style.display = 'none';
+                document.getElementById('join-input-box').style.display = 'none';
+                document.getElementById('btn-ready').style.display = 'block';
+                setOnlineStatus('ルーム ' + code + ' に参加しました。準備完了を押してください。');
+                log('🌐 ルーム ' + code + ' に参加しました。');
+                listenToOnlineRoom();
+            } catch (err) { showOnlineError(err); }
+            finally { pendingOnlineRoom = false; }
+        }
         function copyRoomId() {
             if (!roomId) return;
-            navigator.clipboard.writeText(roomId).then(() => {
-                alert(`ルームID [${roomId}] をコピーしました！`);
-            });
+            navigator.clipboard.writeText(roomId)
+                .then(() => setOnlineStatus('ルームコードをコピーしました: ' + roomId))
+                .catch(() => window.prompt('ルームコードをコピーしてください', roomId));
         }
-
-        function toggleReady() {
-            if (!db || !roomId) return;
-            const ref = db.ref(`rooms/${roomId}/${myRole === 'P1' ? 'p1Ready' : 'p2Ready'}`);
-            ref.set(true);
-            document.getElementById('btn-ready').disabled = true;
-            document.getElementById('btn-ready').innerText = "✓ 準備完了 (待機中)";
+        async function transactRoom(edit, failMessage) {
+            if (onlineBusy) return;
+            onlineBusy = true;
+            try {
+                const uid = await requireOnlineAuth();
+                const result = await roomRef().transaction(data => {
+                    if (!data || data[myRole === 'P1' ? 'p1Uid' : 'p2Uid'] !== uid) return;
+                    if (!edit(data)) return;
+                    data.version = (data.version || 0) + 1;
+                    return data;
+                }, undefined, false);
+                if (!result.committed) { setOnlineStatus(failMessage || '操作できません。対局の状態を確認してください。'); return false; }
+                return true;
+            } catch (err) { showOnlineError(err); return false; }
+            finally { onlineBusy = false; }
         }
-
-        function syncOnlineState() {
-            if (!db || !roomId) return;
-            db.ref('rooms/' + roomId).update({
-                board: JSON.stringify(board),
-                turn: turn,
-                p1TurnCount: p1TurnCount,
-                p2TurnCount: p2TurnCount,
-                p1ObsLeft: p1ObsLeft,
-                p2ObsLeft: p2ObsLeft,
-                gameStarted: gameStarted,
-                gameOver: gameOver,
-                isMeasuring: isMeasuring,
-                awaitActionChoice: awaitActionChoice,
-                lastObservedSeq: lastObservedSeq,
-                winnerRole: winnerRole,
-                winDetailReason: winDetailReason
-            });
-        }
-
-        function listenToOnlineRoom() {
-            db.ref('rooms/' + roomId).on('value', snapshot => {
-                const data = snapshot.val();
-                if (data) {
-                    board = JSON.parse(data.board);
-                    turn = data.turn;
-                    p1TurnCount = data.p1TurnCount;
-                    p2TurnCount = data.p2TurnCount;
-                    p1ObsLeft = data.p1ObsLeft;
-                    p2ObsLeft = data.p2ObsLeft;
-                    p1Ready = data.p1Ready || false;
-                    p2Ready = data.p2Ready || false;
-                    gameStarted = data.gameStarted || false;
-                    gameOver = data.gameOver;
-                    isMeasuring = data.isMeasuring;
-                    awaitActionChoice = data.awaitActionChoice || false;
-
-                    // 勝敗情報の同期
-                    if (data.winnerRole && data.winDetailReason) {
-                        winnerRole = data.winnerRole;
-                        winDetailReason = data.winDetailReason;
-                        renderOutcomeModal();
-                    }
-
-                    // 相手の観測時にも音を鳴らす
-                    if (data.lastObservedSeq && data.lastObservedSeq > lastObservedSeq) {
-                        lastObservedSeq = data.lastObservedSeq;
-                        playSound('observe');
-                    }
-
-                    // ★ 両者Readyになったらランダムで先手/後手を決定
-                    if (p1Ready && p2Ready && !gameStarted) {
-                        gameStarted = true;
-                        if (myRole === 'P1') {
-                            const firstTurn = Math.random() < 0.5 ? 'P1' : 'P2';
-                            db.ref('rooms/' + roomId).update({ 
-                                gameStarted: true,
-                                turn: firstTurn
-                            });
-                        }
-                        document.getElementById('online-status').innerText = "⚔️ マッチング完了！対局スタート！";
-                        log(`⚔️ マッチング完了！ランダム抽選により [${turn}] の先手でスタート！`);
-                    }
-
-                    updateUI();
-                    drawBoard();
+        async function toggleReady() {
+            await transactRoom(data => {
+                if (data.gameStarted || !data.p2Uid) {
+                    if (!data.p2Uid) setOnlineStatus('相手の参加を待っています。');
+                    return false;
                 }
-            });
+                const key = myRole === 'P1' ? 'p1Ready' : 'p2Ready';
+                if (data[key]) return false;
+                data[key] = true;
+                // 2人のReadyが揃った最後の書込みだけが開始を確定
+                if (data.p1Ready && data.p2Ready) {
+                    data.gameStarted = true;
+                    data.turn = Math.random() < 0.5 ? 'P1' : 'P2';
+                }
+                return true;
+            }, '準備完了にできませんでした。');
+        }
+        function canPlayOnline(data, needsPlaced) {
+            return data.gameStarted && !data.gameOver && data.turn === myRole &&
+                Boolean(data.awaitActionChoice) === Boolean(needsPlaced);
+        }
+        async function onlinePlaceStone(r, c) {
+            const succeeded = await transactRoom(data => {
+                if (!canPlayOnline(data, false)) return false;
+                const current = JSON.parse(data.board);
+                if (current[r][c]) return false;
+                const countKey = myRole === 'P1' ? 'p1TurnCount' : 'p2TurnCount';
+                const prob = getNextBlackProbability(myRole, data[countKey]);
+                current[r][c] = {owner:myRole, blackProb:prob, collapsed:false, finalColor:null};
+                data.board = JSON.stringify(current);
+                data[countKey]++;
+                data.awaitActionChoice = true;
+                return true;
+            }, '今は石を置けません。');
+            if (succeeded) playSound('place');
+        }
+        async function onlinePass() {
+            await transactRoom(data => {
+                if (!canPlayOnline(data, true)) return false;
+                data.awaitActionChoice = false;
+                data.turn = data.turn === 'P1' ? 'P2' : 'P1';
+                return true;
+            }, 'ターン終了ができませんでした。');
+        }
+        function winnerFromBoard(a) {
+            const dirs = [[0,1],[1,0],[1,1],[1,-1]];
+            let black = false, white = false;
+            for (let r=0;r<15;r++) for (let c=0;c<15;c++) {
+                const cell = a[r][c];
+                if (!cell || !cell.collapsed) continue;
+                for (const [dr,dc] of dirs) {
+                    let ok = true;
+                    for (let i=1;i<5;i++) {
+                        const nr=r+dr*i, nc=c+dc*i;
+                        if (nr<0||nr>=15||nc<0||nc>=15||!a[nr][nc]||a[nr][nc].finalColor!==cell.finalColor) {ok=false;break;}
+                    }
+                    if (ok) { if(cell.finalColor==='black')black=true; else white=true; }
+                }
+            }
+            return {black,white};
+        }
+        async function onlineObserve() {
+            const succeeded = await transactRoom(data => {
+                if (!canPlayOnline(data, true)) return false;
+                const obsKey = myRole === 'P1' ? 'p1ObsLeft' : 'p2ObsLeft';
+                if (data[obsKey] <= 0) return false;
+                const current = JSON.parse(data.board);
+                current.forEach(row => row.forEach(stone => {
+                    if (stone && !stone.collapsed) {
+                        stone.collapsed = true;
+                        stone.finalColor = Math.random() < stone.blackProb ? 'black' : 'white';
+                    }
+                }));
+                const outcome = winnerFromBoard(current);
+                data[obsKey]--;
+                data.lastObservedSeq++;
+                data.awaitActionChoice = false;
+                if (outcome.black || outcome.white) {
+                    data.gameOver = true;
+                    data.winnerRole = outcome.black && outcome.white ? myRole : outcome.black ? 'P1' : 'P2';
+                    data.winDetailReason = outcome.black && outcome.white
+                        ? '両者の5連が同時に完成（観測実行者の勝利）'
+                        : (outcome.black ? '黒' : '白') + ' の5連が完成しました';
+                    data.board = JSON.stringify(current);
+                } else {
+                    // 勝敗がつかない場合は盤面を重ね合わせに戻す
+                    current.forEach(row => row.forEach(stone => {
+                        if (stone) { stone.collapsed = false; stone.finalColor = null; }
+                    }));
+                    data.board = JSON.stringify(current);
+                    data.turn = data.turn === 'P1' ? 'P2' : 'P1';
+                }
+                return true;
+            }, '観測できませんでした。残り回数や手番を確認してください。');
+            if (succeeded) playSound('observe');
+        }
+        async function onlineVoteRematch() {
+            const ok = await transactRoom(data => {
+                if (!data.gameOver) return false;
+                const key = myRole === 'P1' ? 'p1Rematch' : 'p2Rematch';
+                data[key] = true;
+                if (data.p1Rematch && data.p2Rematch) {
+                    const keep = {p1Uid:data.p1Uid,p2Uid:data.p2Uid};
+                    Object.assign(data, makeInitialRoom(keep.p1Uid));
+                    data.p2Uid = keep.p2Uid;
+                    data.p1Ready = false; data.p2Ready = false;
+                }
+                return true;
+            }, '再戦の申請ができませんでした。');
+            if (ok) setOnlineStatus('再戦希望を送信しました。両者の操作後、Readyから再開できます。');
+        }
+        function listenToOnlineRoom() {
+            if (activeRoomRef) activeRoomRef.off();
+            activeRoomRef = roomRef();
+            displayedObsSeq = 0;
+            activeRoomRef.on('value', snapshot => {
+                const data = snapshot.val();
+                if (!data || gameMode !== 'online' || !roomId) return;
+                const oldSeq = lastObservedSeq;
+                try { board = JSON.parse(data.board); } catch(e) { showOnlineError(e); return; }
+                turn = data.turn;
+                p1TurnCount = data.p1TurnCount;
+                p2TurnCount = data.p2TurnCount;
+                p1ObsLeft = data.p1ObsLeft;
+                p2ObsLeft = data.p2ObsLeft;
+                p1Ready = Boolean(data.p1Ready);
+                p2Ready = Boolean(data.p2Ready);
+                gameStarted = Boolean(data.gameStarted);
+                gameOver = Boolean(data.gameOver);
+                isMeasuring = false;
+                awaitActionChoice = Boolean(data.awaitActionChoice);
+                lastObservedSeq = data.lastObservedSeq || 0;
+                winnerRole = data.winnerRole || null;
+                winDetailReason = data.winDetailReason || '';
+                document.getElementById('btn-ready').disabled = myRole === 'P1' ? p1Ready : p2Ready;
+                document.getElementById('btn-ready').innerText = (myRole === 'P1' ? p1Ready : p2Ready) ? '✓ 準備完了 (待機中)' : '🎮 対局開始準備 (Ready)';
+                document.getElementById('btn-ready').style.display = gameStarted ? 'none' : 'block';
+                if (gameStarted && !gameOver) setOnlineStatus('⚔️ 対局中（ルーム ' + roomId + '）');
+                else if (!data.p2Uid) setOnlineStatus('ルーム ' + roomId + '：相手を待っています。');
+                else if (!gameStarted) setOnlineStatus('ルーム ' + roomId + '：両者がReadyを押してください。');
+                if (lastObservedSeq > oldSeq && oldSeq > 0) log('⚛️ 観測が実行されました。');
+                if (gameOver && winnerRole) renderOutcomeModal();
+                else document.getElementById('banner').style.display = 'none';
+                updateUI(); drawBoard();
+            }, showOnlineError);
         }
 
         window.onload = init;
