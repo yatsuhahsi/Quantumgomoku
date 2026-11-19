@@ -1082,14 +1082,21 @@
                     myRole = existing.p1Uid === uid ? 'P1' : 'P2';
                 } else {
                     if (existing.p2Uid) throw new Error('このルームにはすでに2人参加しています。');
-                    const result = await ref.transaction(data => {
-                        if (!data || data.p2Uid || data.gameStarted || data.p1Uid === uid) return;
-                        data.p2Uid = uid;
-                        data.version = (data.version || 0) + 1;
-                        return data;
-                    }, undefined, false);
-                    if (!result.committed) throw new Error('参加できませんでした。ルームが満員か、対局開始済みです。');
-                    myRole = 'P2';
+                
+if (existing.gameStarted) {
+    throw new Error('このルームは対局開始済みです。');
+}
+
+const result = await ref.child('p2Uid').transaction(currentUid => {
+    if (currentUid === null) return uid;
+    return;
+}, undefined, false);
+
+if (!result.committed) {
+    throw new Error('別のプレイヤーが先に参加した可能性があります。');
+}
+myRole = 'P2';
+
                 }
                 roomId = code;
                 document.getElementById('btn-create-room').style.display = 'none';
